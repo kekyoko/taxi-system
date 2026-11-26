@@ -25,7 +25,7 @@ HEARTBEAT_S = int(os.environ.get("HEARTBEAT_S", "20"))
 ALLOWED_ORIGINS = {settings.client_origin, settings.extra_client_origin}
 
 
-@dataclass
+@dataclass(eq=False)  # identity semantics: WebSocket objects are unhashable
 class Connection:
     socket: WebSocket
     token_hash: str
