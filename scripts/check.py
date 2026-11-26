@@ -9,8 +9,10 @@ import time
 import uuid
 
 import requests
+from websocket import create_connection
 
 API = os.environ.get("API_URL", "http://localhost:8080")
+WS_URL = os.environ.get("WS_URL", API.replace("http://", "ws://").replace("https://", "wss://"))
 results: list[tuple[str, bool, str]] = []
 
 
@@ -173,7 +175,20 @@ def main() -> int:
     head = request("GET", "/v1/me/notifications/head", passenger)
     check("notification feed and head", feed.status_code == 200 and head.status_code == 200,
           f"head={head.json().get('head')}")
-    check("WebSocket ticket issued", request("POST", "/v1/ws-tickets", passenger).status_code == 201)
+    ticket_response = request("POST", "/v1/ws-tickets", passenger)
+    check("WebSocket ticket issued", ticket_response.status_code == 201)
+    if ticket_response.status_code == 201:
+        try:
+            socket = create_connection(
+                f"{WS_URL}/v1/ws?ticket={ticket_response.json()['ticket']}",
+                origin=os.environ.get("CLIENT_ORIGIN", API),
+                timeout=5,
+            )
+            hello = json.loads(socket.recv())
+            socket.close()
+            check("WebSocket upgrade with ticket and Origin", hello.get("type") == "connected")
+        except Exception as error:  # noqa: BLE001 - verification reports the handshake failure
+            check("WebSocket upgrade with ticket and Origin", False, str(error))
 
     failed = [name for name, ok, _ in results if not ok]
     print(f"\nВсього: {len(results)}, успішно: {len(results) - len(failed)}, невдало: {len(failed)}")

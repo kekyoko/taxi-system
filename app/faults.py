@@ -7,7 +7,7 @@ import os
 from pathlib import Path
 
 from .config import settings
-from .db import connection
+from .db import transaction
 
 
 def inject_fault(name: str) -> None:
@@ -17,7 +17,7 @@ def inject_fault(name: str) -> None:
     if not flag.exists():
         return
     flag.unlink(missing_ok=True)
-    with connection() as conn:
+    with transaction() as conn:
         conn.execute(
             "INSERT INTO fault_hits(name, instance) VALUES (%s, %s)",
             (name, settings.instance),

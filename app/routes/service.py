@@ -167,7 +167,7 @@ def notifications(
 def ws_ticket(request: Request, user: User = Depends(current_user)):
     ticket = uuid_str()
     hashed = getattr(request.state, "token_hash", "")
-    with connection() as conn:
+    with transaction() as conn:
         conn.execute(
             "INSERT INTO ws_tickets(ticket, user_id, token_hash, expires_at) VALUES (%s,%s,%s, now()+interval '30 seconds')",
             (ticket, user["id"], hashed),
