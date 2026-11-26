@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="uk">
+<head><meta charset="utf-8"><title>CORS перевірка</title></head>
+<body>
+  <h3>Перевірка браузерного доступу з іншого origin</h3>
+  <p>Подайте цю сторінку з <code>http://localhost:8081</code>, наприклад:
+     <code>python -m http.server 8081 --directory web</code></p>
+  <button onclick="allowed()">Дозволений GET /v1/me</button>
+  <button onclick="forbidden()">Заборонений Origin</button>
+  <pre id="out"></pre>
+  <script>
+    const out = document.getElementById('out');
+    const token = sessionStorage.getItem('taxi_token') || '';
+    async function request(origin) {
+      const headers = { Authorization: 'Bearer ' + token };
+      if (origin) headers['X-Test-Origin'] = origin;
+      // Browser sets Origin itself; a custom header only marks the scenario in the log.
+      const res = await fetch('http://localhost:8080/v1/me', { headers });
+      out.textContent += `${origin || 'звичайний origin'}: ${res.status}\n`;
+    }
+    async function allowed() { await request(''); }
+    async function forbidden() {
+      // Open this page from http://localhost:8081: the browser sends that Origin.
+      // To simulate a rejected origin, change EXTRA_CLIENT_ORIGIN to another value and restart.
+      await request('current-page-origin');
+    }
+  </script>
+</body>
+</html>

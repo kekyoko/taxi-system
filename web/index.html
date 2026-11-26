@@ -1,0 +1,92 @@
+<!doctype html>
+<html lang="uk">
+<head>
+  <meta charset="utf-8">
+  <title>C14 Таксі — клієнт</title>
+  <style>
+    body { font-family: system-ui, sans-serif; max-width: 900px; margin: 2rem auto; }
+    label { display: block; margin-top: .7rem; }
+    input { padding: .4rem; width: 20rem; }
+    button { margin-top: 1rem; padding: .5rem 1rem; }
+    pre { background: #f3f3f3; padding: 1rem; overflow-x: auto; }
+    .row { display: flex; gap: 1rem; }
+  </style>
+</head>
+<body>
+  <h1>Таксі C14</h1>
+  <div class="row">
+    <div>
+      <h3>Вхід</h3>
+      <label>Логін <input id="login" value="passenger1"></label>
+      <label>Пароль <input id="password" type="password" value="pass123"></label>
+      <button onclick="doLogin()">Увійти</button>
+      <button onclick="doLogout()">Вийти</button>
+      <div id="who"></div>
+    </div>
+    <div>
+      <h3>Замовлення</h3>
+      <label>Адреса <input id="pickup" value="вул. Хрещатик, 1"></label>
+      <label>Тариф
+        <select id="tariff">
+          <option value="">standard (старий клієнт)</option>
+          <option value="economy">economy</option>
+          <option value="comfort">comfort</option>
+        </select>
+      </label>
+      <button onclick="order()">Замовити</button>
+      <button onclick="listRides()">Мої поїздки</button>
+    </div>
+  </div>
+  <h3>Сповіщення</h3>
+  <button onclick="watch()">Підключитися</button>
+  <pre id="out"></pre>
+  <script>
+    const out = document.getElementById('out');
+    const log = (value) => { out.textContent += JSON.stringify(value, null, 2) + '\n'; };
+    const token = () => sessionStorage.getItem('taxi_token') || '';
+    async function api(method, path, body, extra = {}) {
+      const headers = { 'Content-Type': 'application/json', ...extra };
+      if (token()) headers.Authorization = 'Bearer ' + token();
+      const res = await fetch(path, { method, headers, body: body ? JSON.stringify(body) : undefined });
+      const data = res.status === 204 ? {} : await res.json().catch(() => ({}));
+      if (!res.ok) log({ error: res.status, problem: data });
+      return { status: res.status, data, headers: res.headers };
+    }
+    async function doLogin() {
+      const r = await api('POST', '/v1/auth/login', {
+        login: document.getElementById('login').value,
+        password: document.getElementById('password').value
+      });
+      if (r.status === 200) {
+        sessionStorage.setItem('taxi_token', r.data.token);
+        document.getElementById('who').textContent = `Користувач: ${r.data.user.login} (${r.data.user.role})`;
+        log(r.data);
+      }
+    }
+    async function doLogout() {
+      await api('POST', '/v1/auth/logout');
+      sessionStorage.removeItem('taxi_token');
+      document.getElementById('who').textContent = '';
+    }
+    async function order() {
+      const tariff = document.getElementById('tariff').value;
+      const body = { district: 'central', pickup: document.getElementById('pickup').value };
+      if (tariff) body.tariff = tariff;
+      const r = await api('POST', '/v1/rides', body, { 'Idempotency-Key': crypto.randomUUID() });
+      if (r.status === 201) log(r.data);
+    }
+    async function listRides() {
+      const r = await api('GET', '/v1/rides?limit=20');
+      if (r.status === 200) log(r.data);
+    }
+    async function watch() {
+      const ticket = await api('POST', '/v1/ws-tickets');
+      if (ticket.status !== 201) return;
+      const protocol = location.protocol === 'https:' ? 'wss' : 'ws';
+      const ws = new WebSocket(`${protocol}://${location.host}/v1/ws?ticket=${ticket.data.ticket}`);
+      ws.onmessage = (event) => log(JSON.parse(event.data));
+      ws.onclose = (event) => log({ closed: event.code });
+    }
+  </script>
+</body>
+</html>

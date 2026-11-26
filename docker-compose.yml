@@ -1,0 +1,170 @@
+name: c14-taxi
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: taxi
+      POSTGRES_PASSWORD: taxi
+      POSTGRES_DB: taxi
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U taxi -d taxi"]
+      interval: 3s
+      timeout: 2s
+      retries: 20
+    ports:
+      - "5432:5432"
+
+  redis:
+    image: redis:7-alpine
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      timeout: 2s
+      retries: 20
+    ports:
+      - "6379:6379"
+
+  migrate:
+    build: .
+    command: ["python", "-m", "app.migrate"]
+    environment: &common_env
+      DATABASE_URL: postgresql://taxi:taxi@postgres:5432/taxi
+      REDIS_URL: redis://redis:6379/0
+      CLIENT_ORIGIN: ${CLIENT_ORIGIN:-http://localhost:8080}
+      EXTRA_CLIENT_ORIGIN: ${EXTRA_CLIENT_ORIGIN:-http://localhost:8081}
+      CURSOR_SECRET: ${CURSOR_SECRET:-taxi-lab-cursor-secret}
+      FAULTS: ${FAULTS:-0}
+      FAULTS_DIR: /faults
+      FEATURE_TARIFFS_V2: ${FEATURE_TARIFFS_V2:-0}
+      ACCEPT_DEADLINE_MINUTES: ${ACCEPT_DEADLINE_MINUTES:-2}
+      POLL_INTERVAL_MS: ${POLL_INTERVAL_MS:-200}
+      WORKER_RETRIES: ${WORKER_RETRIES:-3}
+      SIM_MIN_DELAY_MS: ${SIM_MIN_DELAY_MS:-200}
+      SIM_MAX_DELAY_MS: ${SIM_MAX_DELAY_MS:-800}
+      SIM_FAIL_RATE: ${SIM_FAIL_RATE:-0.10}
+      SIM_DECLINE_RATE: ${SIM_DECLINE_RATE:-0.10}
+      SIM_SEED: ${SIM_SEED:-taxi-seed}
+      SIM_URL: http://external-sim:8085
+    volumes:
+      - ./faults:/faults
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  seed:
+    build: .
+    command: ["python", "scripts/seed.py"]
+    environment: *common_env
+    volumes:
+      - ./faults:/faults
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+
+  app-a:
+    build: .
+    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+    environment:
+      <<: *common_env
+      INSTANCE: app-a
+      FEATURE_TARIFFS_V2: "1"
+    volumes:
+      - ./faults:/faults
+    depends_on:
+      seed:
+        condition: service_completed_successfully
+
+  app-b:
+    build: .
+    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+    environment:
+      <<: *common_env
+      INSTANCE: app-b
+      FEATURE_TARIFFS_V2: "0"
+    volumes:
+      - ./faults:/faults
+    depends_on:
+      seed:
+        condition: service_completed_successfully
+
+  external-sim:
+    build: .
+    command: ["uvicorn", "simulator.main:app", "--host", "0.0.0.0", "--port", "8085"]
+    environment: *common_env
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+
+  publisher:
+    build: .
+    command: ["python", "-m", "app.publisher"]
+    environment:
+      <<: *common_env
+      INSTANCE: publisher
+    volumes:
+      - ./faults:/faults
+    depends_on:
+      seed:
+        condition: service_completed_successfully
+
+  worker:
+    build: .
+    command: ["python", "-m", "app.worker"]
+    environment:
+      <<: *common_env
+      INSTANCE: worker
+    volumes:
+      - ./faults:/faults
+    depends_on:
+      seed:
+        condition: service_completed_successfully
+
+  gateway-a:
+    build: .
+    command: ["uvicorn", "gateway.main:app", "--host", "0.0.0.0", "--port", "8086"]
+    environment:
+      <<: *common_env
+      INSTANCE: gateway-a
+      GATEWAY_GROUP: gateway-a
+      HEARTBEAT_S: "20"
+    volumes:
+      - ./faults:/faults
+    depends_on:
+      seed:
+        condition: service_completed_successfully
+
+  gateway-b:
+    build: .
+    command: ["uvicorn", "gateway.main:app", "--host", "0.0.0.0", "--port", "8086"]
+    environment:
+      <<: *common_env
+      INSTANCE: gateway-b
+      GATEWAY_GROUP: gateway-b
+      HEARTBEAT_S: "20"
+    volumes:
+      - ./faults:/faults
+    depends_on:
+      seed:
+        condition: service_completed_successfully
+
+  nginx:
+    image: nginx:1.27-alpine
+    ports:
+      - "8080:80"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./web:/usr/share/nginx/html:ro
+    depends_on:
+      - app-a
+      - app-b
+      - gateway-a
+      - gateway-b
+      - external-sim
+
+volumes:
+  pgdata:
