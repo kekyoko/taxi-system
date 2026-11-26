@@ -9,7 +9,7 @@ from typing import Literal
 import psycopg.errors
 from fastapi import APIRouter, Depends, Header, Query, Request, Response
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 from psycopg.types.json import Jsonb
 
 from ..db import connection, insert_notification, insert_outbox, transaction
@@ -45,35 +45,60 @@ class RidePatch(BaseModel):
 
     model_config = {"extra": "ignore"}
 
+    @model_validator(mode="before")
+    @classmethod
+    def reject_server_owned_fields(cls, value: object) -> object:
+        # O3.2: silently ignoring a forged owner/state/version is not enough.
+        if isinstance(value, dict):
+            forbidden = {"user_id", "status", "version", "id", "driver_id", "payment_status"}
+            found = forbidden.intersection(value)
+            if found:
+                raise ValueError("Fields are managed by the server: " + ", ".join(sorted(found)))
+        return value
+
+
+def _insert_key(conn, user_id: str, operation: str, key: str, body_hash: str) -> None:
+    with conn.transaction():  # savepoint: a conflicting insert must not abort the tx
+        conn.execute(
+            """
+            INSERT INTO idempotency_records
+                (user_id, operation, key, request_hash, status, expires_at)
+            VALUES (%s, %s, %s, %s, 'processing', now() + interval '24 hours')
+            """,
+            (user_id, operation, key, body_hash),
+        )
+
 
 def _claim_idempotency(conn, user_id: str, operation: str, key: str, body_hash: str):
     """Return None for a new key, or the saved record for a replay."""
-    try:
-        with conn.transaction():  # savepoint: a conflicting insert must not abort the tx
-            conn.execute(
+    for attempt in range(2):
+        try:
+            _insert_key(conn, user_id, operation, key, body_hash)
+            return None
+        except psycopg.errors.UniqueViolation:
+            saved = conn.execute(
                 """
-                INSERT INTO idempotency_records
-                    (user_id, operation, key, request_hash, status, expires_at)
-                VALUES (%s, %s, %s, %s, 'processing', now() + interval '24 hours')
+                SELECT * FROM idempotency_records
+                WHERE user_id = %s AND operation = %s AND key = %s FOR UPDATE
                 """,
-                (user_id, operation, key, body_hash),
-            )
-        return None
-    except psycopg.errors.UniqueViolation:
-        saved = conn.execute(
-            """
-            SELECT * FROM idempotency_records
-            WHERE user_id = %s AND operation = %s AND key = %s FOR UPDATE
-            """,
-            (user_id, operation, key),
-        ).fetchone()
-        if saved is None:
-            raise Problem(409, "Conflict", "Idempotency key is being processed", code="key_in_use")
-        if saved["status"] == "processing":
-            raise Problem(409, "Conflict", "Idempotency key is being processed", code="key_in_use")
-        if saved["request_hash"] != body_hash:
-            raise Problem(422, "Unprocessable Entity", "Idempotency key was used with another body", code="key_body_mismatch")
-        return saved
+                (user_id, operation, key),
+            ).fetchone()
+            if saved is None:
+                raise Problem(409, "Conflict", "Idempotency key is being processed", code="key_in_use")
+            if saved["expires_at"] <= datetime.now(timezone.utc):
+                conn.execute(
+                    "DELETE FROM idempotency_records WHERE user_id=%s AND operation=%s AND key=%s",
+                    (user_id, operation, key),
+                )
+                if attempt == 0:  # expired key is a new key; retry the insert once
+                    continue
+                return None
+            if saved["status"] == "processing":
+                raise Problem(409, "Conflict", "Idempotency key is being processed", code="key_in_use")
+            if saved["request_hash"] != body_hash:
+                raise Problem(422, "Unprocessable Entity", "Idempotency key was used with another body", code="key_body_mismatch")
+            return saved
+    return None
 
 
 def _ride_response(row: dict) -> dict:
@@ -128,6 +153,14 @@ def create_ride(
                 code="feature_disabled",
                 headers={"Retry-After": "5"},
             )
+
+        # A whole district missing is a different outcome from a temporarily
+        # busy pool (409): the requested resource does not exist.
+        district = conn.execute(
+            "SELECT 1 FROM drivers WHERE district = %s LIMIT 1", (body.district,)
+        ).fetchone()
+        if district is None:
+            raise Problem(404, "Not Found", "District not found", code="district_not_found")
 
         # The invariant is protected by a row lock taken inside the same transaction.
         driver = conn.execute(

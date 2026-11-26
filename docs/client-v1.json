@@ -1,0 +1,47 @@
+{
+  "client_version": "1.0 (before tariffs_v2)",
+  "steps": [
+    {
+      "name": "list",
+      "method": "GET",
+      "path": "/v1/rides?limit=5",
+      "status": 200,
+      "fields": ["items", "next_cursor"]
+    },
+    {
+      "name": "create",
+      "method": "POST",
+      "path": "/v1/rides",
+      "body": {"district": "central", "pickup": "вул. Хрещатик, 1", "distance_km": 2.5, "duration_min": 10},
+      "idempotent": true,
+      "status": 201,
+      "save": "ride",
+      "fields": ["id", "status", "tariff"]
+    },
+    {
+      "name": "repeat",
+      "method": "POST",
+      "path": "/v1/rides",
+      "body": {"district": "central", "pickup": "вул. Хрещатик, 1", "distance_km": 2.5, "duration_min": 10},
+      "same_key_as": "create",
+      "status": 201,
+      "same_id_as": "ride"
+    },
+    {
+      "name": "read",
+      "method": "GET",
+      "path": "/v1/rides/{ride}",
+      "status": 200,
+      "fields": ["id", "status", "version"]
+    },
+    {
+      "name": "forbidden_fields",
+      "method": "PATCH",
+      "path": "/v1/rides/{ride}",
+      "body": {"pickup": "вул. Володимирська, 10", "user_id": "u-passenger-2", "status": "finished", "version": 99},
+      "if_match_from": "ride",
+      "status": 422,
+      "fields": ["code"]
+    }
+  ]
+}

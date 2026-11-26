@@ -75,14 +75,18 @@ def insert_notification(
     payload: dict,
 ) -> None:
     """History row and WebSocket outbox row are written in the same transaction."""
-    conn.execute(
+    row = conn.execute(
         """
         INSERT INTO notifications (id, user_id, event_type, payload)
         VALUES (%s, %s, %s, %s)
         ON CONFLICT (id) DO NOTHING
+        RETURNING seq
         """,
         (event_id, user_id, event_type, Jsonb(payload)),
-    )
+    ).fetchone()
+    if row is None:  # replay of the same notification id after a crash
+        row = conn.execute("SELECT seq FROM notifications WHERE id=%s", (event_id,)).fetchone()
+    seq = int(row["seq"]) if row else 0
     insert_outbox(
         conn,
         event_id=f"notify-{event_id}",
@@ -91,5 +95,10 @@ def insert_notification(
         aggregate_type="user",
         aggregate_id=user_id,
         version=1,
-        payload={"user_id": user_id, "notification_id": event_id, "body": payload},
+        payload={
+            "user_id": user_id,
+            "notification_id": event_id,
+            "seq": seq,
+            "body": payload,
+        },
     )

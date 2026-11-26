@@ -115,7 +115,10 @@ outbox `payment.requested` → publisher → worker → `POST /sim/charge` з `k
 | `simulator/main.py` | симулятор платіжного шлюзу з `GET /effects` |
 | `gateway/main.py` | WebSocket-шлюз (два екземпляри, Origin, квитки, 1008/1012) |
 | `client/client.py`, `web/` | консольний і браузерний клієнти |
-| `scripts/seed.py`, `scripts/check.py`, `scripts/fault.sh` | демодані, перевірки, керовані відмови |
+| `scripts/seed.py`, `scripts/check.py`, `scripts/replay.py`, `scripts/fault.sh` | демодані, перевірки, replay старого клієнта, керовані відмови |
+| `scripts/rolling.py`, `scripts/provider_down.py` | відтворювані досліди О6.4 й О4.3 |
+| `checks.yaml`, `docs/CHECKS.md` | метадані й інструкції для зовнішньої перевірки |
+| `docs/compat-table.md`, `docs/client-v1.json`, `docs/ENVIRONMENT.md` | сумісність версій, збережені запити, середовище |
 | `nginx/nginx.conf` | least_conn, проксі WebSocket і симулятора |
 | `openapi.yaml` | контракт OpenAPI 3.1 з прикладами та `x-course` |
 | `docker-compose.yml`, `Dockerfile`, `.env.example` | запуск усієї системи однією командою |
@@ -123,15 +126,15 @@ outbox `payment.requested` → publisher → worker → `POST /sim/charge` з `k
 
 ## 5. Збирання й запуск
 
-Вимоги: Docker 24+, Docker Compose v2.24+, ~4 ГБ RAM, вільні порти **8080** (nginx),
-**5432** (PostgreSQL), **6379** (Redis).
+Вимоги: Docker 24+, Docker Compose v2.24+, ~4 ГБ RAM, вільні порти **8080**
+(nginx — єдина адреса клієнта), **5432** (PostgreSQL), **6379** (Redis); для
+діагностики також **8001/8002** (app-a/app-b), **8085** (симулятор), **8086/8087**
+(шлюзи). Повний опис — [docs/ENVIRONMENT.md](docs/ENVIRONMENT.md).
+
+Одна команда збирання й запуску (файл `.env` необов'язковий — усі значення мають дефолти):
 
 ```bash
-cd taxi-system
-cp .env.example .env
-docker compose build
-docker compose up -d
-docker compose ps
+cd taxi-system && docker compose up -d --build
 ```
 
 Міграції та демодані застосовуються автоматично сервісами `migrate` і `seed` перед
@@ -144,8 +147,14 @@ python -m pip install -r requirements.txt
 python client/client.py login --login passenger1 --password pass123
 python client/client.py ride --pickup "вул. Хрещатик, 1"
 python client/client.py list
-python scripts/check.py
+python scripts/check.py          # 33 перевірки через nginx
+python scripts/replay.py         # збережені запити клієнта попередньої версії
+python scripts/provider_down.py  # тимчасовий 503 постачальника
+python scripts/rolling.py        # навантаження під перемиканням canary
+python -m pytest tests -q
 ```
+
+Метадані для зовнішнього засобу перевірки — `checks.yaml` і [docs/CHECKS.md](docs/CHECKS.md).
 
 Браузерний клієнт: <http://localhost:8080/web/>. Для перевірки CORS з іншого origin:
 
@@ -168,8 +177,10 @@ python -m http.server 8081 --directory web
 PK/FK/CHECK/UNIQUE, `timestamptz`, `numeric`, гроші в копійках), **О1.3**
 (`openapi.yaml`, приклади, Problem Details; linter — див. команду нижче), **О1.4**
 (головна операція в транзакції, 201 + `Location`, 400/404/409/422), **О1.5** (курсор
-за парою `created_at, id`, limit 1–50, HMAC-підпис), **О1.6** (`/health`, X-Request-ID, X-Instance,
-JSON-журнал), **О1.7** (консольний та веб-клієнти), **Д1.1** (правила часу — чисті
+за парою `created_at, id`, limit 1–50, HMAC-підпис), **О1.6** (`/health`, `/ready`, X-Request-ID,
+X-Instance, JSON-журнал із полями `time`, `instance`, `route`, `status`, `duration_ms`),
+**О1.7** (консольний і веб-клієнт читають усі сторінки списку й показують Problem Details),
+**Д1.1** (правила часу — чисті
 функції), **Д1.5** (нічний тариф, копійки, межі часу).
 
 Перевірка: `python scripts/check.py`, `python -m pytest tests -q`.
@@ -177,9 +188,10 @@ JSON-журнал), **О1.7** (консольний та веб-клієнти),
 ### ЛР2. Конкуренція та повторення запитів
 
 Виконано: **О2.1** (`FOR UPDATE SKIP LOCKED` на `drivers`, дослід через обидва
-екземпляри), **О2.2** (таблиця `idempotency_records`, канонічний відбиток, 400/409/422),
+екземпляри), **О2.2** (таблиця `idempotency_records`, канонічний відбиток, 400/409/422, очищення
+прострочених ключів порціями з `SKIP LOCKED`),
 **О2.3** (`after_commit_before_response`), **О2.4** (клієнт: backoff + jitter,
-`Retry-After`, 4 спроби, 30 с, «результат невідомий»), **Д2.4** (`If-Match`/ETag),
+`Retry-After`, повтор 409 `key_in_use`, 4 спроби, 30 с, «результат невідомий»), **Д2.4** (`If-Match`/ETag),
 **Д2.5** (повторне скасування).
 
 Перевірка: `python client/client.py concurrency --orders 20 --workers 20`, потім
@@ -189,7 +201,7 @@ JSON-журнал), **О1.7** (консольний та веб-клієнти),
 
 Виконано: **О3.1** (непрозорі серверні сесії, 1 год, logout знищує запис у базі),
 **О3.2** (власник перевіряється в SQL; чужий і відсутній об'єкт — однаковий 404;
-зміна `user_id`/`status`/`version` з тіла ігнорується моделлю; staff-маршрути — 403),
+спроба змінити `user_id`/`status`/`version` з тіла дає **422**; staff-маршрути — 403),
 **О3.3** (CORS для `CLIENT_ORIGIN` та `EXTRA_CLIENT_ORIGIN`, без `*`, OPTIONS,
 токен у `sessionStorage`, Origin перевіряється ще й шлюзом), **О3.4** (сценарії в обох
 клієнтах). Заголовок `X-User-Id` більше не приймається.
@@ -199,9 +211,11 @@ JSON-журнал), **О1.7** (консольний та веб-клієнти),
 
 ### ЛР4. Довгі операції, події й зовнішня система
 
-Виконано: **О4.1** (`operations`, 202 + `Location` + `Retry-After`, повтор ключа),
-**О4.2** (Transactional Outbox,publisher з `SKIP LOCKED`, стабільний `id`, ключ =
-ідентифікатор сутності), **О4.3** (worker викликає симулятор із ключем операції,
+Виконано: **О4.1** (`operations`, 202 + `Location` + `Retry-After`, повтор ключа,
+стани `pending → running → succeeded/failed`, версія й результат у відповіді),
+**О4.2** (Transactional Outbox, publisher з `SKIP LOCKED`, стабільний `id`, поле
+`message_key` = ідентифікатор сутності), **О4.3** (worker викликає симулятор із ключем
+операції, розрізняє успіх, предметне відхилення й тимчасову недоступність (503 без ACK),
 фіксує результат і сповіщення однією транзакцією, ACK після фіксації), **О4.4**
 (обидві керовані відмови), **О4.5** (клієнт опитує операцію з урахуванням `Retry-After`).
 
@@ -210,12 +224,13 @@ JSON-журнал), **О1.7** (консольний та веб-клієнти),
 
 ### ЛР5. Сповіщення через WebSocket
 
-Виконано: **О5.1** (одноразовий квиток 30 с, перевірка Origin перед `accept`,
-закриття 1008 після logout), **О5.2** (два шлюзи, окремі групи споживачів, локальна
-дедуплікація за `notification_id`, heartbeat 20 с < `proxy_read_timeout 60s`),
-**О5.3** (`/v1/me/notifications/head` + стрічка за `after`; клієнт спочатку підписується,
-потім читає межу й історію, потім застосовує буфер), **О5.4** (показ сповіщень у
-консолі та веб-клієнті, повторне підключення з нового квитка).
+Виконано: **О5.1** (одноразовий квиток 30 с, обов'язковий Origin і перевірка живої
+сесії перед `accept`, закриття 1008 після logout), **О5.2** (два шлюзи, окремі групи
+споживачів, локальна дедуплікація за `notification_id`, heartbeat 20 с <
+`proxy_read_timeout 60s`), **О5.3** (`/v1/me/notifications/head` + стрічка за `after`;
+WS-повідомлення несуть той самий `seq`; клієнт спочатку підписується, потім читає межу
+й історію, потім застосовує буфер без дублів), **О5.4** (показ сповіщень у консолі та
+веб-клієнті, повторне підключення з нового квитка й дочитування з останнього `seq`).
 
 Перевірка: `python client/client.py watch --seconds 40` у двох терміналах для двох
 різних шлюзів (nginx `least_conn`), а потік створює поїздку з третього термінала.
@@ -224,8 +239,9 @@ JSON-журнал), **О1.7** (консольний та веб-клієнти),
 
 Виконано: **О6.1** (міграція `003_tariffs.sql` розширює схему; нові тарифи `economy` і
 `comfort` увімкнено прапорцем `tariffs_v2`; відкат — `enabled: false`, попередні
-поїздки зберігають свій тариф), **О6.2** (старий клієнт без поля `tariff` працює;
-події мають `schema_version: 1`, новий обробник читає відсутні поля як за замовчуванням),
+поїздки зберігають свій тариф), **О6.2** (автоматичний replay збережених запитів старого клієнта — `python scripts/replay.py`,
+`docs/client-v1.json`; події мають `schema_version: 1`, новий обробник читає відсутні поля
+як за замовчуванням; таблиця сумісності — [docs/compat-table.md](docs/compat-table.md)),
 **О6.3** (`/ready` повертає 503 під час drain; uvicorn завершує запити; шлюз закриває
 з'єднання кодом 1012), **О6.4** (канарка: `app-a` має `FEATURE_TARIFFS_V2=1`, `app-b` —
 `0`; перемикання прапорця без релізу).
@@ -238,7 +254,11 @@ python client/client.py flag tariffs_v2 true
 python client/client.py ride --tariff comfort --distance 7.5
 python client/client.py flag tariffs_v2 false
 python client/client.py ride   # старий формат, стандартний тариф
+python scripts/replay.py       # автоматична перевірка сумісності О6.2
 ```
+
+Canary задається розгортанням, а не ім'ям у коді: `app-a` має `FEATURE_TARIFFS_V2=1`,
+`app-b` — `0`; master-прапорець лежить у БД (`feature_flags.tariffs_v2`).
 
 Відкат до межі: вимкнути прапорець; видаляти колонки не потрібно — значення
 залишаються сумісними. Необоротних кроків до цієї межі немає.
@@ -264,19 +284,25 @@ python client/client.py ride   # старий формат, стандартни
 | О4.3 | `app/worker.py`, `simulator/main.py` | `python client/client.py effects` |
 | О4.4 | `app/faults.py` | розділ 8 |
 | О5.1–О5.4 | `gateway/main.py`, `app/routes/service.py` | `python client/client.py watch` |
-| О6.1–О6.4 | `migrations/003_tariffs.sql`, `app/deps.py:feature_tariffs_enabled` | команди вище |
+| О6.1–О6.4 | `migrations/003_tariffs.sql`, `app/deps.py:feature_tariffs_enabled` | команди вище, `python scripts/replay.py` |
+| Контракт для check | `openapi.yaml` (`x-course`), `checks.yaml` | `docs/CHECKS.md`, `python scripts/check.py` |
 
 ## 7. Досліди
 
-| Дослід | Режим і команда | Що видно |
-| --- | --- | --- |
-| 20 замовлень на 5 водіїв через два екземпляри | `FAULTS=0 docker compose up -d`; `python client/client.py concurrency --orders 20`; `python client/client.py drivers` | 201 × 5, 409 × 15, усі водії `busy`, жоден не призначений двічі |
-| Повтор того самого ключа | `python scripts/check.py` | друга відповідь має той самий `id`, 422 для іншого тіла |
-| Втрачена відповідь | розділ 8, `after_commit_before_response` | повтор повертає збережений 201, одна поїздка |
-| Сповіщення після зупинки шлюзу | `docker compose stop gateway-a`; `watch --seconds 40`; `docker compose start gateway-a` | клієнт перепідключається й дочитує від останнього `seq` без дублів |
-| Зміна тарифу | `flag tariffs_v2 true/false` | старий запит без `tariff` працює в обох режимах |
-| Канаркове увімкнення | `app-a` з прапорцем, `app-b` без нього; 20 запитів | частина запитів отримує новий тариф, частка 409/422 не перевищує порогу |
-| Один ефект постачальника | `python client/client.py pay <id>` + `effects` | `by_key` містить ключ один раз |
+Усі досліди виконані через nginx `http://localhost:8080` на стенді з тими самими процесами,
+що описані в `docker-compose.yml`. Чисел нижче — з останнього повного прогону.
+
+| Початкові дані | Параметри / команда | Очікуваний результат | Фактичний результат |
+| --- | --- | --- | --- |
+| 3 користувачі, 7 водіїв (5 у `central`, 2 у `north`), два екземпляри app | `python scripts/check.py`, 20 паралельних `POST /v1/rides` | 201 × 5 і 409 × 15; жоден водій не призначений двічі | **201 × 5, 409 × 15**; загалом **33/33 PASS** |
+| Ключ ідемпотентності першого замовлення | повтор того самого `POST` із тим самим тілом; потім інше тіло з тим самим ключем | той самий `id`; 422 для іншого тіла | той самий `id`; **422 `key_body_mismatch`**, обидві перевірки PASS |
+| Прапорець `after_commit_before_response`, вільний водій | `touch faults/after_commit_before_response`, `POST /v1/rides` із новим ключем, рестарт app | COMMIT збережено, відповідь втрачено (502); повтор ключа дає збережений 201; поїздка одна | `fault.hit` в `app-b` (502); після рестарту **201, той самий `ride_id`**, `rides_for_id = 1`, `fault_hits = 1` |
+| Прапорець `publisher_before_send`, порожня черга outbox | `touch faults/publisher_before_send`, створити поїздку, рестарт publisher | рядки лишаються `published_at IS NULL`, публікуються з тим самим `id`; сповіщення не дублюється | `fault.hit` у publisher; після рестарту **2/2 опубліковано**, `pending = 0`, 1 унікальне `driver.assigned`, `fault_hits = 1` |
+| Поїздку прийнято й завершено, платіж із новим ключем | `touch faults/after_external_before_commit`, `POST /payments`, рестарт worker | ефект шлюзу вже є, локального COMMIT/ACK немає; XAUTOCLAIM повторює виклик із тим самим ключем | `fault.hit` у worker; після рестарту **`succeeded`, version 2**, 1 ефект у `by_key`, 1 сповіщення, `fault_hits` +1 |
+| Симулятор недоступний 6 секунд | `python scripts/provider_down.py` → `POST /sim/admin/unavailable?seconds=6` | проміжний стан `running`; 503 не закріплюється за ключем; після відновлення success без нового ефекту | **`running → succeeded`**, version 2, 1 ефект, `RESULT: PASS` |
+| Два WebSocket-шлюзи, одноразовий квиток | `python scripts/check.py`, WS-повідомлення | 101 тільки з Origin і живою сесією; повідомлення несуть `seq` і не дублюються | upgrade PASS, **`seq = 434`** у повідомленні, відмова без Origin PASS, 50 позицій стрічки без дублів |
+| Збережені запити клієнта v1 без поля `tariff` | `python scripts/replay.py` | старі запити працюють на новому сервері | **5/5 PASS** (list, create, repeat, read, forbidden_fields → 422) |
+| Canary: `app-a` із `FEATURE_TARIFFS_V2=1`, `app-b` із `0`, master-прапорець у БД | `python scripts/rolling.py`: 300 запитів, 10 потоків, `true → false → true` | 200 без технічних помилок; обидва екземпляри обслуговують трафік; прапорець повертається у `false` | **300 × 200**, **0 технічних помилок**, `app-a` 149 / `app-b` 151, 71.45 c, середня 2146.6 мс, прапорець вимкнено |
 
 Порівняльні режими «без захисту інваріанта» не реалізовані: пункт **Д2.2** не обрано,
 отже небезпечний режим не потрібен. Режим старого клієнта зберігається параметром
@@ -287,12 +313,14 @@ python client/client.py ride   # старий формат, стандартни
 Усі відмови потребують `FAULTS=1` у `.env` і прапорця в `./faults` (том змонтовано у
 всі процеси). Один прапорець спричиняє одну відмову, бо процес забирає файл перед
 аварійним виходом (`os._exit(137)`), а запис `fault.hit` називає місце в журналі.
+Redis запускається з `--appendonly yes`: потоки подій переживають рестарт брокера,
+інакше подія, вже позначена `published_at`, була б втрачена.
 
 | Місце | Увімкнення | Що видно в журналі | Відновлення |
 | --- | --- | --- | --- |
 | після `COMMIT`, до відповіді | `bash scripts/fault.sh after_commit_before_response`, потім створити поїздку | `{"event":"fault.hit","name":"after_commit_before_response"}` | `docker compose restart app-a`; повторити запит із тим самим `Idempotency-Key` через app-b — повернеться збережений 201, поїздка одна |
 | після вибірки outbox, до публікації | `bash scripts/fault.sh publisher_before_send`, потім створити поїздку | `fault.hit` у `publisher` | `docker compose restart publisher`; рядок усе ще `published_at IS NULL`, буде опубліковано з тим самим `id` |
-| після симулятора, до локальної фіксації | `bash scripts/fault.sh after_external_before_commit`, потім оплатити поїздку | `fault.hit` у `worker` | `docker compose restart worker`; `XAUTOCLAIM` повертає повідомлення, симулятор за тим самим ключем повертає збережений ефект, `GET /sim/effects` показує 1 ефект і 1 сповіщення |
+| після симулятора, до локальної фіксації | `bash scripts/fault.sh after_external_before_commit`, потім оплатити поїздку | `fault.hit` у `worker` | `docker compose restart worker`; `XAUTOCLAIM` (сумісний із redis-py 5) повертає повідомлення, симулятор за тим самим ключем повертає збережений ефект, `GET /sim/effects` показує 1 ефект і 1 сповіщення |
 
 Межі: гарантії не поширюються на реальні мапи/маршрути (картка забороняє),
 справжні платежі, багатомашинний Swarm/K8s (Д6.4 не обрано), довільні збої диску й

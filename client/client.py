@@ -10,7 +10,10 @@ import sys
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from pathlib import Path
+from urllib.parse import quote
 
 import requests
 from websocket import create_connection
@@ -29,6 +32,23 @@ def load_token() -> str:
 
 def save_token(token: str) -> None:
     STATE.write_text(json.dumps({"token": token}), encoding="utf-8")
+
+
+def retry_after(headers: dict, default: float) -> float:
+    """Honour Retry-After (seconds or HTTP-date) before the next poll/retry."""
+    value = headers.get("Retry-After")
+    if not value:
+        return float(default)
+    try:
+        return max(0.0, float(value))
+    except ValueError:
+        try:
+            when = parsedate_to_datetime(value)
+            if when.tzinfo is None:
+                when = when.replace(tzinfo=timezone.utc)
+            return max(0.0, (when - datetime.now(timezone.utc)).total_seconds())
+        except (TypeError, ValueError):
+            return float(default)
 
 
 def call(method: str, path: str, *, token: str | None = None, **kwargs) -> tuple[int, dict, dict]:
@@ -93,9 +113,12 @@ def ride(args) -> None:
             print(json.dumps(body, ensure_ascii=False, indent=2))
             print("Location:", headers.get("Location", ""))
             return
-        retry_after = int(headers.get("Retry-After") or 1)
-        if status in (429, 503, 0) and attempt < args.attempts and time.monotonic() < deadline:
-            pause = max(retry_after, min(0.5 * 2 ** attempt, 8)) * (1 + random.random() * 0.25)
+        transient = status in (429, 503, 0) or (
+            status == 409 and body.get("code") == "key_in_use"
+        )
+        if transient and attempt < args.attempts and time.monotonic() < deadline:
+            pause = max(retry_after(headers, 1), min(0.5 * 2 ** attempt, 8))
+            pause *= 1 + random.random() * 0.25  # jitter avoids a retry storm
             print(f"Повтор {attempt}/{args.attempts} через {pause:.2f} с, той самий ключ {key}")
             time.sleep(pause)
             continue
@@ -105,10 +128,25 @@ def ride(args) -> None:
 
 
 def list_rides(args) -> None:
-    path = f"/v1/rides?limit={args.limit}" + (f"&cursor={args.cursor}" if args.cursor else "")
-    status, body, _ = call("GET", path)
-    if status == 200:
-        print(json.dumps(body, ensure_ascii=False, indent=2))
+    """Read every page: an unknown next_cursor must not hide older rides."""
+    cursor = args.cursor
+    items: list[dict] = []
+    pages = 0
+    seen: set[str] = set()
+    while True:
+        path = f"/v1/rides?limit={args.limit}"
+        if cursor:
+            path += f"&cursor={quote(str(cursor), safe='')}"
+        status, body, _ = call("GET", path)
+        if status != 200:
+            return
+        pages += 1
+        items.extend(body.get("items", []))
+        cursor = body.get("next_cursor")
+        if not cursor or str(cursor) in seen:
+            break
+        seen.add(str(cursor))
+    print(json.dumps({"items": items, "pages": pages, "count": len(items)}, ensure_ascii=False, indent=2))
 
 
 def get_ride(args) -> None:
@@ -162,12 +200,17 @@ def pay(args) -> None:
     operation = body.get("operation_id")
     print("Операція:", operation)
     deadline = time.monotonic() + 60
+    delay = retry_after(headers, 2)
     while time.monotonic() < deadline:
-        status, body, _ = call("GET", f"/v1/operations/{operation}")
+        time.sleep(min(delay, max(0.0, deadline - time.monotonic())))
+        status, body, headers = call("GET", f"/v1/operations/{operation}")
+        if status != 200:
+            print(f"РЕЗУЛЬТАТ НЕВІДОМИЙ: GET операції повернув {status}")
+            return
         if body.get("status") in ("succeeded", "failed"):
             print(json.dumps(body, ensure_ascii=False, indent=2))
             return
-        time.sleep(2)
+        delay = retry_after(headers, delay)
     print("РЕЗУЛЬТАТ НЕВІДОМИЙ: операція не завершилася вчасно")
 
 
@@ -252,7 +295,9 @@ def watch(args) -> None:
                 message = json.loads(raw)
                 if message.get("type") == "heartbeat":
                     continue
-                _apply(message, applied)
+                # WS carries the same monotonic seq as the feed; a gap left by
+                # a broken socket is filled on the next history read.
+                last_seq = max(last_seq, _apply(message, applied))
         finally:
             socket.close()
         status, ticket_body, _ = call("POST", "/v1/ws-tickets")

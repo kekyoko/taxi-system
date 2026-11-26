@@ -7,6 +7,8 @@ info:
     two app instances sit behind nginx. Tariffs v2 are a feature-flagged change.
   contact:
     name: Team Zhivotchenko, Strilets, Lisoyvan, Kuz
+x-course:
+  topic: C14
 servers:
   - url: http://localhost:8080
     description: nginx (only external entry point)
@@ -29,7 +31,9 @@ paths:
           content:
             application/json:
               schema: {type: object, properties: {status: {type: string}, instance: {type: string}}}
-              example: {status: ok, instance: app-a}
+              examples:
+                app_a: {value: {status: ok, instance: app-a}}
+                app_b: {value: {status: ok, instance: app-b}}
   /ready:
     get:
       tags: [service]
@@ -57,7 +61,8 @@ paths:
           content:
             application/json:
               schema: {$ref: '#/components/schemas/LoginResponse'}
-              example: {token: opaque-token, token_type: Bearer, expires_at: '2026-11-26T12:00:00Z', user: {id: u-passenger-1, login: passenger1, role: user, district: central}}
+              examples:
+                passenger: {value: {token: opaque-token, token_type: Bearer, expires_at: '2026-11-26T12:00:00Z', user: {id: u-passenger-1, login: passenger1, role: user, district: central}}}
         '401': {$ref: '#/components/responses/Problem'}
   /v1/auth/logout:
     post:
@@ -79,6 +84,10 @@ paths:
           content:
             application/json:
               schema: {$ref: '#/components/schemas/User'}
+              examples:
+                passenger: {value: {id: u-passenger-1, login: passenger1, role: user, district: central}}
+                dispatcher: {value: {id: u-dispatcher, login: dispatcher, role: staff, district: central}}
+        '401': {$ref: '#/components/responses/Problem'}
   /v1/rides:
     post:
       tags: [rides]
@@ -86,7 +95,7 @@ paths:
       summary: Order a ride; pick a free driver with FOR UPDATE SKIP LOCKED
       description: Main operation. Idempotency-Key is mandatory; replay returns the saved 201.
       security: [{bearerAuth: []}]
-      x-course: {topic: C14, roles: [user]}
+      x-course: main
       parameters:
         - $ref: '#/components/parameters/IdempotencyKey'
       requestBody:
@@ -95,6 +104,16 @@ paths:
           application/json:
             schema: {$ref: '#/components/schemas/RideCreate'}
             examples:
+              normal:
+                summary: Звичайне замовлення (5 водіїв у central)
+                value: {district: central, pickup: вул. Хрещатик, 1, distance_km: 2.5, duration_min: 10}
+              scarce:
+                summary: Гонка за 5 водіїв — 20 запитів дадуть 201×5 і 409×15
+                value: {district: central, pickup: вул. Хрещатик, 1, distance_km: 3, duration_min: 12}
+                x-capacity: 5
+              missing:
+                summary: Району немає — 404
+                value: {district: no-such-district, pickup: вул. Хрещатик, 1}
               old_client:
                 summary: Pre-tariff client (defaults to standard)
                 value: {district: central, pickup: вул. Хрещатик, 1}
@@ -110,9 +129,11 @@ paths:
           content:
             application/json:
               schema: {$ref: '#/components/schemas/Ride'}
-              example: {id: 7d6f, user_id: u-passenger-1, district: central, pickup: вул. Хрещатик, 1, driver_id: d-1, status: assigned, payment_status: unpaid, fare_minor: 3700, currency: UAH, version: 1, tariff: standard, distance_km: '2.50', created_at: '2026-11-26T10:00:00Z', accept_deadline: '2026-11-26T10:02:00Z'}
+              examples:
+                created: {value: {id: 7d6f, user_id: u-passenger-1, district: central, pickup: вул. Хрещатик, 1, driver_id: d-1, status: assigned, payment_status: unpaid, fare_minor: 3700, currency: UAH, version: 1, tariff: standard, distance_km: '2.50', created_at: '2026-11-26T10:00:00Z', accept_deadline: '2026-11-26T10:02:00Z'}}
         '400': {$ref: '#/components/responses/Problem'}
         '401': {$ref: '#/components/responses/Problem'}
+        '404': {$ref: '#/components/responses/Problem'}
         '409': {$ref: '#/components/responses/Problem'}
         '422': {$ref: '#/components/responses/Problem'}
     get:
@@ -120,7 +141,7 @@ paths:
       operationId: listRides
       summary: My rides, newest first, opaque cursor
       security: [{bearerAuth: []}]
-      x-course: {topic: C14, roles: [user]}
+      x-course: list
       parameters:
         - name: limit
           in: query
@@ -148,7 +169,7 @@ paths:
       operationId: getRide
       summary: My ride only; foreign or missing ride is 404
       security: [{bearerAuth: []}]
-      x-course: {topic: C14, roles: [user]}
+      x-course: object
       responses:
         '200':
           description: Ride
@@ -163,7 +184,7 @@ paths:
       operationId: patchRide
       summary: Change pickup with If-Match
       security: [{bearerAuth: []}]
-      x-course: {topic: C14, roles: [user]}
+      x-course: update
       parameters:
         - $ref: '#/components/parameters/IfMatch'
       requestBody:
@@ -171,7 +192,13 @@ paths:
         content:
           application/json:
             schema: {$ref: '#/components/schemas/RidePatch'}
-            example: {pickup: вул. Володимирська, 10}
+            examples:
+              normal:
+                summary: Дозволена зміна адреси
+                value: {pickup: вул. Володимирська, 10}
+              forbidden:
+                summary: Спроба змінити власника/стан/версію — 422
+                value: {pickup: вул. Володимирська, 10, user_id: u-passenger-2, status: finished, version: 99}
       responses:
         '200':
           description: Updated ride
@@ -180,8 +207,10 @@ paths:
           content:
             application/json:
               schema: {$ref: '#/components/schemas/Ride'}
+        '401': {$ref: '#/components/responses/Problem'}
         '404': {$ref: '#/components/responses/Problem'}
         '412': {$ref: '#/components/responses/Problem'}
+        '422': {$ref: '#/components/responses/Problem'}
         '428': {$ref: '#/components/responses/Problem'}
   /v1/rides/{ride_id}/cancel:
     post:
@@ -189,7 +218,7 @@ paths:
       operationId: cancelRide
       summary: Cancel; a replay never frees the driver twice
       security: [{bearerAuth: []}]
-      x-course: {topic: C14, roles: [user]}
+      x-course: cancel
       parameters:
         - $ref: '#/components/parameters/RideId'
       responses:
@@ -202,7 +231,7 @@ paths:
       operationId: acceptRide
       summary: Dispatcher accepts or reassigns after accept_deadline
       security: [{bearerAuth: []}]
-      x-course: {topic: C14, roles: [staff]}
+      x-course: staff-action
       parameters:
         - $ref: '#/components/parameters/RideId'
       responses:
@@ -215,7 +244,7 @@ paths:
       operationId: finishRide
       summary: Dispatcher finishes the ride (night tariff rule)
       security: [{bearerAuth: []}]
-      x-course: {topic: C14, roles: [staff]}
+      x-course: staff-action
       parameters:
         - $ref: '#/components/parameters/RideId'
       responses:
@@ -228,7 +257,7 @@ paths:
       operationId: startPayment
       summary: Start async payment, returns 202 + Location + Retry-After
       security: [{bearerAuth: []}]
-      x-course: {topic: C14, roles: [user]}
+      x-course: long-operation
       parameters:
         - $ref: '#/components/parameters/RideId'
         - $ref: '#/components/parameters/IdempotencyKey'
@@ -237,7 +266,13 @@ paths:
         content:
           application/json:
             schema: {$ref: '#/components/schemas/PaymentRequest'}
-            example: {amount_minor: 3700, currency: UAH}
+            examples:
+              default_fare:
+                summary: Сплатити розраховану вартість поїздки
+                value: {}
+              custom_amount:
+                summary: Явна сума в копійках
+                value: {amount_minor: 3700, currency: UAH}
       responses:
         '202':
           description: Operation accepted
@@ -248,7 +283,9 @@ paths:
             application/json:
               schema: {$ref: '#/components/schemas/Operation'}
         '400': {$ref: '#/components/responses/Problem'}
+        '401': {$ref: '#/components/responses/Problem'}
         '409': {$ref: '#/components/responses/Problem'}
+        '422': {$ref: '#/components/responses/Problem'}
   /v1/operations/{operation_id}:
     get:
       tags: [service]
@@ -266,6 +303,7 @@ paths:
           content:
             application/json:
               schema: {$ref: '#/components/schemas/Operation'}
+        '401': {$ref: '#/components/responses/Problem'}
         '404': {$ref: '#/components/responses/Problem'}
   /v1/drivers:
     get:
@@ -273,7 +311,7 @@ paths:
       operationId: listDrivers
       summary: Staff view of the driver pool
       security: [{bearerAuth: []}]
-      x-course: {topic: C14, roles: [staff]}
+      x-course: staff-action
       responses:
         '200': {description: Drivers}
         '403': {$ref: '#/components/responses/Problem'}
@@ -283,7 +321,7 @@ paths:
       operationId: driverOffline
       summary: Staff takes a driver off the line
       security: [{bearerAuth: []}]
-      x-course: {topic: C14, roles: [staff]}
+      x-course: staff-action
       parameters:
         - name: driver_id
           in: path
@@ -299,7 +337,7 @@ paths:
       operationId: driverOnline
       summary: Staff returns a driver to the line
       security: [{bearerAuth: []}]
-      x-course: {topic: C14, roles: [staff]}
+      x-course: staff-action
       parameters:
         - name: driver_id
           in: path
@@ -307,6 +345,7 @@ paths:
           schema: {type: string}
       responses:
         '200': {description: Driver online}
+        '403': {$ref: '#/components/responses/Problem'}
   /v1/admin/features:
     get:
       tags: [staff]
@@ -314,6 +353,8 @@ paths:
       security: [{bearerAuth: []}]
       responses:
         '200': {description: Feature flags}
+        '401': {$ref: '#/components/responses/Problem'}
+        '403': {$ref: '#/components/responses/Problem'}
   /v1/admin/features/{name}:
     post:
       tags: [staff]
@@ -330,9 +371,13 @@ paths:
         content:
           application/json:
             schema: {type: object, required: [enabled], properties: {enabled: {type: boolean}}}
-            example: {enabled: true}
+            examples:
+              enable: {value: {enabled: true}}
+              rollback: {value: {enabled: false}}
       responses:
         '200': {description: Updated flag}
+        '401': {$ref: '#/components/responses/Problem'}
+        '403': {$ref: '#/components/responses/Problem'}
   /v1/me/notifications:
     get:
       tags: [service]
@@ -343,7 +388,19 @@ paths:
         - {name: after, in: query, schema: {type: integer, minimum: 0, default: 0}}
         - {name: limit, in: query, schema: {type: integer, minimum: 1, maximum: 50, default: 50}}
       responses:
-        '200': {description: Notification page}
+        '200':
+          description: Notification page with growing seq positions
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items: {type: array, items: {type: object}}
+                  next_cursor: {type: [integer, 'null']}
+              examples:
+                page: {value: {items: [{seq: 7, id: n-7, type: driver.assigned, payload: {ride_id: 7d6f}}], next_cursor: null}}
+        '400': {$ref: '#/components/responses/Problem'}
+        '401': {$ref: '#/components/responses/Problem'}
   /v1/me/notifications/head:
     get:
       tags: [service]
@@ -356,7 +413,9 @@ paths:
           content:
             application/json:
               schema: {type: object, properties: {head: {type: integer}}}
-              example: {head: 12}
+              examples:
+                head: {value: {head: 12}}
+        '401': {$ref: '#/components/responses/Problem'}
   /v1/ws-tickets:
     post:
       tags: [service]
@@ -364,7 +423,14 @@ paths:
       summary: Single-use WebSocket ticket, 30 s TTL
       security: [{bearerAuth: []}]
       responses:
-        '201': {description: Ticket issued}
+        '201':
+          description: Ticket issued
+          content:
+            application/json:
+              schema: {type: object, properties: {ticket: {type: string}, url: {type: string}, expires_in_s: {type: integer}}}
+              examples:
+                ticket: {value: {ticket: 7d6f, url: '/v1/ws?ticket=7d6f', expires_in_s: 30}}
+        '401': {$ref: '#/components/responses/Problem'}
   /v1/ws:
     get:
       tags: [service]
@@ -386,11 +452,21 @@ paths:
         content:
           application/json:
             schema: {type: object, required: [key, amount_minor], properties: {key: {type: string}, amount_minor: {type: integer}, currency: {type: string}}}
-            example: {key: op-id, amount_minor: 3700, currency: UAH}
+            examples:
+              charge: {value: {key: op-id, amount_minor: 3700, currency: UAH}}
       responses:
         '200': {description: Success}
         '422': {$ref: '#/components/responses/Problem'}
         '503': {$ref: '#/components/responses/Problem'}
+  /sim/admin/unavailable:
+    post:
+      tags: [simulator]
+      operationId: simUnavailable
+      summary: Make the provider return 503 for N seconds (technical failure experiment)
+      parameters:
+        - {name: seconds, in: query, schema: {type: integer, minimum: 1, maximum: 120, default: 5}}
+      responses:
+        '200': {description: Mode enabled}
   /sim/effects:
     get:
       tags: [simulator]
@@ -429,7 +505,9 @@ components:
       content:
         application/problem+json:
           schema: {$ref: '#/components/schemas/Problem'}
-          example: {type: 'https://example.edu/taxi/problems/no_driver', title: Conflict, status: 409, detail: No free driver in this district, code: no_driver}
+          examples:
+            no_driver: {value: {type: 'https://example.edu/taxi/problems/no_driver', title: Conflict, status: 409, detail: No free driver in this district, code: no_driver}}
+            key_body_mismatch: {value: {type: 'https://example.edu/taxi/problems/key_body_mismatch', title: Unprocessable Entity, status: 422, detail: Idempotency key was used with another body, code: key_body_mismatch}}
   schemas:
     Problem:
       type: object

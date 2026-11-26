@@ -39,11 +39,22 @@
   </div>
   <h3>Сповіщення</h3>
   <button onclick="watch()">Підключитися</button>
+  <button onclick="stopWatch()">Відключитися</button>
   <pre id="out"></pre>
   <script>
     const out = document.getElementById('out');
     const log = (value) => { out.textContent += JSON.stringify(value, null, 2) + '\n'; };
     const token = () => sessionStorage.getItem('taxi_token') || '';
+
+    // O5.3: one feed position and one set of applied ids across all sockets.
+    let lastSeq = 0;
+    let applied = new Set();
+    let socket = null;
+    let watching = false;
+    let catchingUp = false;
+    let buffer = [];
+    let reconnectTimer = null;
+
     async function api(method, path, body, extra = {}) {
       const headers = { 'Content-Type': 'application/json', ...extra };
       if (token()) headers.Authorization = 'Bearer ' + token();
@@ -52,6 +63,7 @@
       if (!res.ok) log({ error: res.status, problem: data });
       return { status: res.status, data, headers: res.headers };
     }
+
     async function doLogin() {
       const r = await api('POST', '/v1/auth/login', {
         login: document.getElementById('login').value,
@@ -60,14 +72,19 @@
       if (r.status === 200) {
         sessionStorage.setItem('taxi_token', r.data.token);
         document.getElementById('who').textContent = `Користувач: ${r.data.user.login} (${r.data.user.role})`;
+        lastSeq = 0;
+        applied = new Set();
         log(r.data);
       }
     }
+
     async function doLogout() {
+      stopWatch();
       await api('POST', '/v1/auth/logout');
       sessionStorage.removeItem('taxi_token');
       document.getElementById('who').textContent = '';
     }
+
     async function order() {
       const tariff = document.getElementById('tariff').value;
       const body = { district: 'central', pickup: document.getElementById('pickup').value };
@@ -75,17 +92,99 @@
       const r = await api('POST', '/v1/rides', body, { 'Idempotency-Key': crypto.randomUUID() });
       if (r.status === 201) log(r.data);
     }
+
     async function listRides() {
-      const r = await api('GET', '/v1/rides?limit=20');
-      if (r.status === 200) log(r.data);
+      let cursor = '';
+      const items = [];
+      let pages = 0;
+      const seen = new Set();
+      while (true) {
+        let path = '/v1/rides?limit=20';
+        if (cursor) path += '&cursor=' + encodeURIComponent(cursor);
+        const r = await api('GET', path);
+        if (r.status !== 200) return;
+        pages++;
+        items.push(...(r.data.items || []));
+        cursor = r.data.next_cursor;
+        if (!cursor || seen.has(String(cursor))) break;
+        seen.add(String(cursor));
+      }
+      log({ items, pages, count: items.length });
     }
-    async function watch() {
+
+    function apply(notification) {
+      const id = notification.id || notification.notification_id;
+      if (!id || applied.has(id)) return;
+      applied.add(id);
+      lastSeq = Math.max(lastSeq, Number(notification.seq || 0));
+      log(notification);
+    }
+
+    // Subscribe first, then read head + history to the captured boundary,
+    // then apply messages that arrived while history was being loaded.
+    async function catchUp() {
+      catchingUp = true;
+      try {
+        const headResponse = await api('GET', '/v1/me/notifications/head');
+        if (headResponse.status !== 200) return;
+        const head = Number(headResponse.data.head || 0);
+        let after = lastSeq;
+        const seen = new Set();
+        while (after < head) {
+          const page = await api('GET', `/v1/me/notifications?after=${after}&limit=50`);
+          if (page.status !== 200) break;
+          const rows = page.data.items || [];
+          for (const item of rows) {
+            apply(item);
+            after = Math.max(after, Number(item.seq || 0));
+          }
+          const next = page.data.next_cursor;
+          if (!rows.length || !next || seen.has(String(next))) break;
+          seen.add(String(next));
+        }
+      } finally {
+        catchingUp = false;
+        const pending = buffer;
+        buffer = [];
+        pending.forEach(apply);
+      }
+    }
+
+    async function connect() {
+      if (!watching || !token()) return;
       const ticket = await api('POST', '/v1/ws-tickets');
       if (ticket.status !== 201) return;
       const protocol = location.protocol === 'https:' ? 'wss' : 'ws';
       const ws = new WebSocket(`${protocol}://${location.host}/v1/ws?ticket=${ticket.data.ticket}`);
-      ws.onmessage = (event) => log(JSON.parse(event.data));
-      ws.onclose = (event) => log({ closed: event.code });
+      socket = ws;
+      ws.onopen = () => catchUp();  // subscription is live before the head is read
+      ws.onmessage = (event) => {
+        const message = JSON.parse(event.data);
+        if (message.type === 'heartbeat') return;
+        if (catchingUp) buffer.push(message);
+        else apply(message);
+      };
+      ws.onclose = (event) => {
+        log({ closed: event.code });
+        if (socket === ws) socket = null;
+        // A new ticket is issued on every reconnect; history fills any gap.
+        if (watching && token() && event.code !== 1008) {
+          reconnectTimer = setTimeout(connect, 2000);
+        }
+      };
+    }
+
+    function watch() {
+      if (!token()) { log({ error: 'Увійдіть спочатку' }); return; }
+      watching = true;
+      connect();
+    }
+
+    function stopWatch() {
+      watching = false;
+      if (reconnectTimer) clearTimeout(reconnectTimer);
+      if (socket) socket.close(1000, 'Client closed');
+      socket = null;
     }
   </script>
 </body>

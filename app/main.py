@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
+import signal
 import time
 import uuid
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from typing import AsyncIterator
 
 from fastapi import FastAPI, Request
@@ -17,6 +20,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from .config import settings
 from .db import connection
+from .deps import cleanup_expired_keys
 from .errors import (
     Problem,
     bad_json_handler,
@@ -28,15 +32,50 @@ from .errors import (
 from .routes import admin, auth, rides, service
 
 logger = logging.getLogger("taxi.app")
+logger.setLevel(logging.INFO)
+if not logger.handlers:  # uvicorn configures only the "uvicorn*" loggers
+    _handler = logging.StreamHandler()
+    _handler.setFormatter(logging.Formatter("%(message)s"))
+    logger.addHandler(_handler)
+logger.propagate = False
+
+
+async def _cleanup_loop() -> None:
+    while True:
+        await asyncio.sleep(30)
+        try:
+            removed = await asyncio.to_thread(cleanup_expired_keys)
+            if removed:
+                logger.info(json.dumps({"event": "idempotency.cleanup", "removed": removed}))
+        except Exception as error:  # noqa: BLE001 - housekeeping must not kill the app
+            logger.warning(json.dumps({"event": "idempotency.cleanup_error", "error": str(error)}))
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.shutting_down = False
+    previous: dict[int, object] = {}
+
+    def _drain(signum: int, frame: object) -> None:
+        # Flip readiness at signal time, before uvicorn stops accepting work.
+        app.state.shutting_down = True
+        handler = previous.get(signum)
+        if callable(handler):
+            handler(signum, frame)
+
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        previous[sig] = signal.getsignal(sig)
+        signal.signal(sig, _drain)
+    cleanup_task = asyncio.create_task(_cleanup_loop())
     logger.info(json.dumps({"event": "startup", "instance": settings.instance}))
-    yield
-    app.state.shutting_down = True
-    logger.info(json.dumps({"event": "shutdown", "instance": settings.instance}))
+    try:
+        yield
+    finally:
+        app.state.shutting_down = True
+        cleanup_task.cancel()
+        for sig, handler in previous.items():
+            signal.signal(sig, handler)  # type: ignore[arg-type]
+        logger.info(json.dumps({"event": "shutdown", "instance": settings.instance}))
 
 
 app = FastAPI(
@@ -80,6 +119,7 @@ async def request_context(request: Request, call_next):
             json.dumps(
                 {
                     "event": "request",
+                    "time": datetime.now(timezone.utc).isoformat(),
                     "request_id": request_id,
                     "instance": settings.instance,
                     "route": template,

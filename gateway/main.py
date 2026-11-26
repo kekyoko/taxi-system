@@ -73,6 +73,9 @@ async def _deliver(fields: dict[str, str]) -> None:
         return
     message = {
         "id": notification_id,
+        # Stable monotonic position from the notification row; lets the client
+        # resume catch-up after a disconnect without duplicates or gaps.
+        "seq": int(payload.get("seq") or 0),
         "type": event_type,
         "payload": payload.get("body", {}),
     }
@@ -150,15 +153,23 @@ def health():
 @app.websocket("/v1/ws")
 async def websocket_endpoint(websocket: WebSocket, ticket: str = ""):
     origin = websocket.headers.get("origin")
-    if origin and origin not in ALLOWED_ORIGINS:
+    if not origin or origin not in ALLOWED_ORIGINS:
+        # Reject before accept(): no authenticated socket for a foreign origin.
         await websocket.close(code=1008, reason="Origin not allowed")
         return
     with transaction() as conn:
         row = conn.execute(
             """
-            UPDATE ws_tickets SET used_at=now()
-            WHERE ticket=%s AND used_at IS NULL AND expires_at > now()
-            RETURNING user_id, token_hash
+            WITH claimed AS (
+                UPDATE ws_tickets SET used_at=now()
+                WHERE ticket=%s AND used_at IS NULL AND expires_at > now()
+                RETURNING user_id, token_hash
+            )
+            SELECT claimed.user_id, claimed.token_hash
+            FROM claimed
+            JOIN sessions s ON s.token_hash = claimed.token_hash
+                          AND s.user_id = claimed.user_id
+                          AND s.expires_at > now()
             """,
             (ticket,),
         ).fetchone()

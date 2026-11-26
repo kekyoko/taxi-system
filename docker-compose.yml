@@ -19,6 +19,9 @@ services:
 
   redis:
     image: redis:7-alpine
+    # Streams must survive a broker restart: the outbox is only released after
+    # XADD, so losing the stream would lose an already-published domain event.
+    command: ["redis-server", "--appendonly", "yes", "--appendfsync", "everysec"]
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 3s
@@ -26,6 +29,9 @@ services:
       retries: 20
     ports:
       - "6379:6379"
+    networks:
+      default:
+        aliases: [broker]
 
   migrate:
     build: .
@@ -69,6 +75,8 @@ services:
   app-a:
     build: .
     command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+    ports:
+      - "8001:8000"  # diagnostics only; the client uses nginx :8080
     environment:
       <<: *common_env
       INSTANCE: app-a
@@ -82,6 +90,8 @@ services:
   app-b:
     build: .
     command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+    ports:
+      - "8002:8000"  # diagnostics only; the client uses nginx :8080
     environment:
       <<: *common_env
       INSTANCE: app-b
@@ -127,6 +137,8 @@ services:
   gateway-a:
     build: .
     command: ["uvicorn", "gateway.main:app", "--host", "0.0.0.0", "--port", "8086"]
+    ports:
+      - "8086:8086"  # diagnostics only; WebSocket clients use nginx :8080
     environment:
       <<: *common_env
       INSTANCE: gateway-a
@@ -141,6 +153,8 @@ services:
   gateway-b:
     build: .
     command: ["uvicorn", "gateway.main:app", "--host", "0.0.0.0", "--port", "8086"]
+    ports:
+      - "8087:8086"  # diagnostics only; WebSocket clients use nginx :8080
     environment:
       <<: *common_env
       INSTANCE: gateway-b

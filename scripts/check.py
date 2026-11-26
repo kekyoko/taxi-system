@@ -77,11 +77,17 @@ def main() -> int:
     second = new_ride(passenger, key)
     changed = new_ride(passenger, key, {"pickup": "інша адреса"})
     check("main operation 201 + Location", first.status_code == 201 and bool(first.headers.get("Location")))
+    check("X-Request-ID on response", bool(first.headers.get("X-Request-ID")))
     check("idempotent replay returns saved result",
           second.status_code == 201 and second.json().get("id") == first.json().get("id"))
     check("same key with another body is 422", changed.status_code == 422, str(changed.status_code))
     ride_id = first.json().get("id", "")
     etag = first.headers.get("ETag", '"1"')
+
+    forged = request("PATCH", f"/v1/rides/{ride_id}", passenger,
+                     json={"pickup": "а", "status": "finished", "user_id": "u-passenger-2"},
+                     headers={"If-Match": etag})
+    check("forged owner/state fields are 422", forged.status_code == 422, str(forged.status_code))
 
     check("own ride readable", request("GET", f"/v1/rides/{ride_id}", passenger).status_code == 200)
     check("foreign ride is 404", request("GET", f"/v1/rides/{ride_id}", other).status_code == 404)
@@ -156,6 +162,7 @@ def main() -> int:
     payment = request("POST", f"/v1/rides/{ride_id}/payments", passenger,
                       json={}, headers={"Idempotency-Key": str(uuid.uuid4())})
     check("payment starts asynchronously", payment.status_code == 202 and bool(payment.headers.get("Location")))
+    check("payment returns Retry-After", bool(payment.headers.get("Retry-After")))
     operation_id = payment.json().get("operation_id", "")
     final = None
     for _ in range(30):
@@ -173,8 +180,11 @@ def main() -> int:
 
     feed = request("GET", "/v1/me/notifications?limit=50", passenger)
     head = request("GET", "/v1/me/notifications/head", passenger)
+    positions = [item.get("seq", 0) for item in feed.json().get("items", [])]
     check("notification feed and head", feed.status_code == 200 and head.status_code == 200,
           f"head={head.json().get('head')}")
+    check("notification positions grow without duplicates",
+          positions == sorted(set(positions)), f"{len(positions)} items")
     ticket_response = request("POST", "/v1/ws-tickets", passenger)
     check("WebSocket ticket issued", ticket_response.status_code == 201)
     if ticket_response.status_code == 201:
@@ -185,10 +195,31 @@ def main() -> int:
                 timeout=5,
             )
             hello = json.loads(socket.recv())
-            socket.close()
             check("WebSocket upgrade with ticket and Origin", hello.get("type") == "connected")
+            socket.settimeout(10)
+            free_drivers(dispatcher)
+            created = new_ride(passenger)
+            message = json.loads(socket.recv())
+            check("WS notification carries seq",
+                  created.status_code == 201 and int(message.get("seq") or 0) > 0,
+                  str(message)[:120])
+            socket.close()
         except Exception as error:  # noqa: BLE001 - verification reports the handshake failure
             check("WebSocket upgrade with ticket and Origin", False, str(error))
+            check("WS notification carries seq", False, str(error))
+
+    # A ticket is single-use: a second one is needed for the negative Origin test.
+    second = request("POST", "/v1/ws-tickets", passenger)
+    if second.status_code == 201:
+        try:
+            bad = create_connection(
+                f"{WS_URL}/v1/ws?ticket={second.json()['ticket']}",
+                suppress_origin=True, timeout=5,
+            )
+            check("WebSocket rejects a request without Origin", False)
+            bad.close()
+        except Exception:  # noqa: BLE001 - 1008 before accept() is the expected outcome
+            check("WebSocket rejects a request without Origin", True)
 
     failed = [name for name, ok, _ in results if not ok]
     print(f"\nВсього: {len(results)}, успішно: {len(results) - len(failed)}, невдало: {len(failed)}")

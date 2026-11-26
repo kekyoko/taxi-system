@@ -1,0 +1,55 @@
+# Metadata for the teacher's external check. openapi.yaml supplies routes,
+# roles (x-course) and request examples; this file supplies only what the
+# contract cannot express. See docs/CHECKS.md.
+
+items:
+  - О1.5   # список із курсором
+  - О1.6   # JSON-журнал і службові маршрути
+  - О1.7   # клієнт
+  - О2.3   # втрачена відповідь після COMMIT
+  - О2.4   # повтори клієнта
+  - Д2.4   # If-Match / ETag
+  - Д2.5   # повторне скасування
+  - О3.3   # CORS / Origin
+  - О3.4   # сценарії входу й доступу в клієнті
+  - О4.4   # відновлення після керованих відмов
+  - О4.5   # клієнт асинхронної операції
+  - О5.3   # стрічка сповіщень і відновлення
+  - О5.4   # клієнт сповіщень
+  - О6.2   # сумісність версій (replay: docs/client-v1.json)
+  - О6.4   # поступове оновлення під навантаженням
+  - Д5.5   # heartbeat 20 s < proxy_read_timeout 60 s
+
+role_names:
+  user: user
+  staff: staff
+
+# Published diagnostics ports. Product clients use only nginx :8080.
+instances:
+  app-a: "http://localhost:8001"
+  app-b: "http://localhost:8002"
+gateways:
+  - "ws://localhost:8086"
+  - "ws://localhost:8087"
+
+services:
+  nginx: nginx
+  app-a: app-a
+  app-b: app-b
+  postgres: postgres
+  broker: redis
+  publisher: publisher
+  worker: worker
+  external-sim: external-sim
+  gateway-a: gateway-a
+  gateway-b: gateway-b
+
+log_fields:
+  time: time
+  instance: instance
+  route: route
+  status: status
+  duration: duration_ms
+
+heartbeat_s: 20
+simulator_down: "/sim/admin/unavailable?seconds={seconds}"

@@ -7,7 +7,7 @@ from typing import Any
 from fastapi import Depends, Header, Request
 
 from .config import settings
-from .db import connection
+from .db import connection, transaction
 from .errors import Problem
 from .security import token_hash
 
@@ -62,6 +62,23 @@ def feature_tariffs_enabled(conn: Any) -> bool:
         "SELECT enabled FROM feature_flags WHERE name = 'tariffs_v2'"
     ).fetchone()
     master = bool(row and row["enabled"])
-    # Per-instance flag allows a canary: app-a only, app-b keeps old behaviour.
-    canary = settings.feature_tariffs_v2 or settings.instance == "app-a"
-    return master and canary
+    # Canary is a deployment setting, not a hard-coded instance name:
+    # docker-compose gives app-a FEATURE_TARIFFS_V2=1 and app-b =0.
+    return master and settings.feature_tariffs_v2
+
+
+def cleanup_expired_keys(batch: int = 500) -> int:
+    """Delete expired idempotency keys in bounded batches (O2.2)."""
+    with transaction() as conn:
+        cursor = conn.execute(
+            """
+            DELETE FROM idempotency_records
+            WHERE (user_id, operation, key) IN (
+                SELECT user_id, operation, key FROM idempotency_records
+                WHERE expires_at <= now() ORDER BY expires_at LIMIT %s
+                FOR UPDATE SKIP LOCKED
+            )
+            """,
+            (batch,),
+        )
+        return cursor.rowcount or 0

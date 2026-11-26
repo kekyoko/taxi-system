@@ -18,6 +18,10 @@ from .faults import inject_fault
 GROUP = "taxi-worker"
 
 
+class ProviderUnavailable(RuntimeError):
+    """Transient provider failure: the message must stay unacknowledged for retry."""
+
+
 def _already_processed(event_id: str) -> bool:
     with connection() as conn:
         return (
@@ -30,13 +34,13 @@ def _already_processed(event_id: str) -> bool:
 
 
 def _call_provider(provider_key: str, amount_minor: int, currency: str) -> tuple[str, dict]:
+    """Return succeeded / declined (business rule) / unavailable (technical)."""
     url = f"{settings.sim_url}/charge"
     payload = {"key": provider_key, "amount_minor": amount_minor, "currency": currency}
     for attempt in range(settings.worker_retries + 1):
         try:
             response = httpx.post(url, json=payload, timeout=15.0)
         except httpx.HTTPError as error:
-            response = None
             print(json.dumps({"event": "provider.network_error", "error": str(error)}), flush=True)
         else:
             if response.status_code == 200:
@@ -44,10 +48,21 @@ def _call_provider(provider_key: str, amount_minor: int, currency: str) -> tuple
             if response.status_code == 422:
                 return "declined", response.json()
             if response.status_code != 503:
-                return "declined", {"reason": "unexpected_provider_response", "status": response.status_code}
+                return "declined", {
+                    "reason": "unexpected_provider_response",
+                    "status": response.status_code,
+                }
+            print(json.dumps({"event": "provider.unavailable", "status": 503}), flush=True)
         if attempt < settings.worker_retries:
             time.sleep(2**attempt)
-    return "declined", {"reason": "provider_unavailable"}
+    return "unavailable", {"reason": "provider_unavailable"}
+
+
+def claimed_items(reclaimed: object) -> list:
+    """XAUTOCLAIM result: redis-py 5 gives a list, older releases a tuple."""
+    if isinstance(reclaimed, (list, tuple)) and len(reclaimed) >= 2:
+        return list(reclaimed[1] or [])
+    return []
 
 
 def handle(fields: dict[str, str]) -> None:
@@ -71,6 +86,26 @@ def handle(fields: dict[str, str]) -> None:
         ).fetchone()
     if operation is None:
         return
+    if operation["status"] in ("succeeded", "failed"):
+        # A redelivery after a crash: the effect is already final.
+        with transaction() as conn:
+            conn.execute(
+                "INSERT INTO processed_messages(handler, event_id) VALUES ('worker', %s) ON CONFLICT DO NOTHING",
+                (event_id,),
+            )
+        return
+
+    # Published before the external call so GET /v1/operations can observe
+    # pending -> running (O4.1). A retry after a crash sees the same state.
+    with transaction() as conn:
+        conn.execute(
+            """
+            UPDATE operations SET status='running', updated_at=now()
+            WHERE id=%s AND status='pending'
+            """,
+            (operation_id,),
+        )
+
     request = operation["request"] or {}
     status, provider_result = _call_provider(
         operation["provider_key"],
@@ -78,6 +113,11 @@ def handle(fields: dict[str, str]) -> None:
         str(request.get("currency", "UAH")),
     )
     inject_fault("after_external_before_commit")
+
+    if status == "unavailable":
+        # No local commit and no ACK: XAUTOCLAIM reclaims it and the simulator
+        # is called again with the same operation key (503 is not remembered).
+        raise ProviderUnavailable(provider_result.get("reason", "provider_unavailable"))
 
     with transaction() as conn:
         if _already_processed_in(conn, event_id):
@@ -155,10 +195,9 @@ def main() -> None:
                 start_id="0-0", count=10,
             )
             items_by_source = [items for _, items in messages]
-            if isinstance(reclaimed, tuple) and len(reclaimed) >= 2:
-                claimed = reclaimed[1]
-                if claimed:
-                    items_by_source.append(claimed)
+            claimed = claimed_items(reclaimed)
+            if claimed:
+                items_by_source.append(claimed)
             for items in items_by_source:
                 for message_id, fields in items:
                     try:

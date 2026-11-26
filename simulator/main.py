@@ -8,7 +8,7 @@ import os
 import random
 import time
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Query
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from psycopg.types.json import Jsonb
@@ -27,6 +27,7 @@ MAX_DELAY_MS = int(os.environ.get("SIM_MAX_DELAY_MS", "800"))
 FAIL_RATE = float(os.environ.get("SIM_FAIL_RATE", "0.10"))
 DECLINE_RATE = float(os.environ.get("SIM_DECLINE_RATE", "0.10"))
 SEED = os.environ.get("SIM_SEED", "taxi-seed")
+UNAVAILABLE_UNTIL = 0.0  # controlled "provider is down for N seconds" mode
 
 
 class Charge(BaseModel):
@@ -55,6 +56,18 @@ def charge(body: Charge):
     if saved:
         status_code = 200 if saved["status"] == "succeeded" else 422
         return JSONResponse(status_code=status_code, content=saved["response"])
+
+    if time.monotonic() < UNAVAILABLE_UNTIL:
+        # 503 is never remembered for a key: a later retry can succeed.
+        return JSONResponse(
+            status_code=503,
+            content={
+                "type": "https://example.edu/taxi/problems/provider_unavailable",
+                "title": "Service Unavailable", "status": 503,
+                "detail": "Payment gateway temporarily unavailable",
+            },
+            headers={"Retry-After": "2"},
+        )
 
     rng = _rng(body.key)
     delay = rng.uniform(MIN_DELAY_MS, MAX_DELAY_MS) / 1000
@@ -122,6 +135,14 @@ def effects(key: str | None = None):
         ],
         "by_key": {row["provider_key"]: row["status"] for row in rows},
     }
+
+
+@app.post("/admin/unavailable")
+def set_unavailable(seconds: int = Query(default=5, ge=1, le=120)):
+    """Force technical failures for a bounded period (O4.3 experiment)."""
+    global UNAVAILABLE_UNTIL
+    UNAVAILABLE_UNTIL = time.monotonic() + seconds
+    return {"unavailable_for_s": seconds}
 
 
 @app.get("/config")

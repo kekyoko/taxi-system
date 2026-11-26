@@ -30,6 +30,9 @@ def ensure_group(stream: str, group: str) -> None:
 def event_fields(row: dict) -> dict[str, str]:
     return {
         "event_id": row["id"],
+        # Redis Streams assigns monotonic entry IDs; the business message key
+        # is carried explicitly so republishing the same entity keeps its key.
+        "message_key": row["aggregate_id"],
         "event_type": row["event_type"],
         "aggregate_type": row["aggregate_type"],
         "aggregate_id": row["aggregate_id"],

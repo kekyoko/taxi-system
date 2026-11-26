@@ -14,9 +14,11 @@ def inject_fault(name: str) -> None:
     if not settings.fault_mode:
         return
     flag = Path(settings.faults_dir) / name
-    if not flag.exists():
+    # One flag must cause exactly one crash even when several processes poll it.
+    try:
+        flag.unlink()
+    except FileNotFoundError:
         return
-    flag.unlink(missing_ok=True)
     with transaction() as conn:
         conn.execute(
             "INSERT INTO fault_hits(name, instance) VALUES (%s, %s)",
