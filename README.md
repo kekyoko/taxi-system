@@ -168,7 +168,7 @@ python -m http.server 8081 --directory web
 PK/FK/CHECK/UNIQUE, `timestamptz`, `numeric`, гроші в копійках), **О1.3**
 (`openapi.yaml`, приклади, Problem Details; linter — див. команду нижче), **О1.4**
 (головна операція в транзакції, 201 + `Location`, 400/404/409/422), **О1.5** (курсор
-за парою `created_at, id`, limit 1–50, HMAC-підпис), **О1.6** (`/health`, X-Request-ID,
+за парою `created_at, id`, limit 1–50, HMAC-підпис), **О1.6** (`/health`, X-Request-ID, X-Instance,
 JSON-журнал), **О1.7** (консольний та веб-клієнти), **Д1.1** (правила часу — чисті
 функції), **Д1.5** (нічний тариф, копійки, межі часу).
 

@@ -120,10 +120,15 @@ def main() -> int:
 
     # Tariff flag and backward compatibility.
     request("POST", "/v1/admin/features/tariffs_v2", dispatcher, json={"enabled": True})
-    # nginx least_conn may pick the canary-free instance first; retry a few times.
+    # least_conn alternates backends. A probe on app-b makes the next POST
+    # land on the canary-enabled app-a, so the tariff check is deterministic.
     tariff_statuses = []
     for _ in range(6):
         free_drivers(dispatcher)
+        for _probe in range(6):
+            probe = request("GET", "/health")
+            if probe.headers.get("X-Instance") == "app-b":
+                break
         tariff_ride = new_ride(passenger, body={"tariff": "comfort", "distance_km": 7.5})
         tariff_statuses.append(tariff_ride.status_code)
         if tariff_ride.status_code == 201:

@@ -52,7 +52,7 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
     allow_headers=["Authorization", "Content-Type", "Idempotency-Key", "If-Match", "X-Request-ID"],
-    expose_headers=["Location", "ETag", "Retry-After", "X-Request-ID"],
+    expose_headers=["Location", "ETag", "Retry-After", "X-Request-ID", "X-Instance"],
 )
 
 app.add_exception_handler(Problem, problem_handler)
@@ -91,6 +91,7 @@ async def request_context(request: Request, call_next):
         )
         if response is not None:
             response.headers["X-Request-ID"] = request_id
+            response.headers["X-Instance"] = settings.instance
 
 
 @app.get("/health", tags=["service"], summary="Liveness: no database call")
