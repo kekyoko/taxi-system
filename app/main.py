@@ -117,3 +117,12 @@ app.include_router(auth.router)
 app.include_router(rides.router)
 app.include_router(admin.router)
 app.include_router(service.router)
+
+# Contract-facing alias: clients and openapi.yaml use /v1/me.
+app.add_api_route(
+    "/v1/me",
+    auth.me,
+    methods=["GET"],
+    tags=["auth"],
+    summary="Current principal and role",
+)
