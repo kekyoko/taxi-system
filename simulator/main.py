@@ -105,7 +105,7 @@ def effects(key: str | None = None):
             """
             SELECT provider_key, status, response, created_at
             FROM sim.provider_effects
-            WHERE %s IS NULL OR provider_key = %s
+            WHERE %s::text IS NULL OR provider_key = %s::text
             ORDER BY created_at, provider_key
             """,
             (key, key),
