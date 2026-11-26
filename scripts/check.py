@@ -120,9 +120,16 @@ def main() -> int:
 
     # Tariff flag and backward compatibility.
     request("POST", "/v1/admin/features/tariffs_v2", dispatcher, json={"enabled": True})
-    free_drivers(dispatcher)
-    tariff_ride = new_ride(passenger, body={"tariff": "comfort", "distance_km": 7.5})
-    check("tariffs v2 enabled by flag", tariff_ride.status_code == 201, str(tariff_ride.status_code))
+    # nginx least_conn may pick the canary-free instance first; retry a few times.
+    tariff_statuses = []
+    for _ in range(6):
+        free_drivers(dispatcher)
+        tariff_ride = new_ride(passenger, body={"tariff": "comfort", "distance_km": 7.5})
+        tariff_statuses.append(tariff_ride.status_code)
+        if tariff_ride.status_code == 201:
+            break
+    check("tariffs v2 enabled by flag on canary instance",
+          201 in tariff_statuses, str(tariff_statuses))
     free_drivers(dispatcher)
     old_client = request("POST", "/v1/rides", passenger,
                          json={"district": "central", "pickup": "без тарифу"},
